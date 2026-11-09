@@ -272,15 +272,6 @@ function hintFraudType(rows, triggered) {
   const participantMidExit = midExits.length > 0;
   steps.push(`participantMidExit: ${participantMidExit} (${midExits.length} mid-exit withdrawals)`);
 
-  // honeypot conditions
-  const allWithdrawalsBlocked =
-    withdrawals.length > 0 &&
-    withdrawals.every(r => (parseFloat(r.amount_eth) || 0) === 0);
-  const inflowContinues = withdrawals.length > 0 && (() => {
-    const firstWBlock = Math.min(...withdrawals.map(r => parseInt(r.block) || 0));
-    return deposits.some(r => parseInt(r.block) > firstWBlock);
-  })();
-
   // pump-and-dump conditions
   const someWithdrawalsSucceed = withdrawals.some(r => (parseFloat(r.amount_eth) || 0) > 0);
   const someWithdrawalsFail    = withdrawals.some(r => (parseFloat(r.amount_eth) || 0) === 0);
@@ -297,56 +288,223 @@ function hintFraudType(rows, triggered) {
     return received > deposited;
   });
 
-  // ── Priority 1: Flash Loan ──
-  if (ids.has("OSCILLATING_BALANCE")) {
-    steps.push("→ flash_loan (OSCILLATING_BALANCE signal)");
-    return { hint: "flash_loan", reasoning_steps: steps };
+  // ── 러그풀 교차공리 최종안 (2026-10-14): 사실값 계산 ──
+  // 모든 값은 지갑별 "낸 돈(deposited)"과 "받은 돈(received)"에서 나온다.
+  // hasRealAddresses: N=272 XBlock 평가처럼 주소가 합성(0x000...)된 데이터에서는
+  //   지갑별 계산이 의미가 없으므로 기존 규칙을 그대로 쓴다 (팀원 폰지 평가 보존).
+  const hasRealAddresses =
+    deposits.length > 0 && !deposits.every(r => /^0x0{30,}/i.test(r.from || ""));
+  steps.push(`hasRealAddresses: ${hasRealAddresses}`);
+
+  const receivedByAddr = new Map();
+  for (const r of withdrawals) {
+    const amt = parseFloat(r.amount_eth) || 0;
+    if (amt > 0) receivedByAddr.set(r.to, (receivedByAddr.get(r.to) || 0) + amt);
   }
 
-  // ── Priority 2: Honeypot ──
-  if (allWithdrawalsBlocked && inflowContinues) {
-    steps.push(`→ honeypot (all ${withdrawals.length} withdrawals blocked, inflow continues)`);
-    return { hint: "honeypot", reasoning_steps: steps };
+  // [기본 공리] NetDrain ≡ Σ_a max(0, received(a) − deposited(a)) ≥ 0.7 × peak
+  //   입금 이력 없는 운영자는 받은 돈 전부, 입금자로 위장한 운영자(evasive_C)는 순수익이 잡힌다.
+  let netDrainAmount = 0;
+  for (const [addr, got] of receivedByAddr.entries()) {
+    netDrainAmount += Math.max(0, got - (depositorAmtMap.get(addr) || 0));
+  }
+  const netDrainRatio = peak > 0 ? netDrainAmount / peak : 0;
+  const netDrain = peak > 0 && netDrainAmount >= peak * 0.70;
+  steps.push(
+    `netDrain: ${netDrain} (순수익 합 ${netDrainAmount.toFixed(3)} / peak ${peak.toFixed(3)} = ` +
+    `${(netDrainRatio * 100).toFixed(0)}%, 기준 70%)`
+  );
+
+  // [교차 공리] SharedProfit ≡ |{a : deposited(a) > 0 ∧ received(a) ≥ 1.05 × deposited(a)}| ≥ 2
+  //   러그풀은 ¬SharedProfit, 폰지·펌프앤덤프는 SharedProfit → 판정 순서와 무관하게 배타.
+  let profitSharerCount = 0;
+  for (const [addr, got] of receivedByAddr.entries()) {
+    const dep = depositorAmtMap.get(addr) || 0;
+    if (dep > 0 && got >= dep * 1.05) profitSharerCount++;
+  }
+  const sharedProfit = profitSharerCount >= 2;
+  steps.push(`sharedProfit: ${sharedProfit} (105% 이상 회수한 입금자 ${profitSharerCount}명, 기준 2명)`);
+
+  // [적용 범위] T (반복 중계): 실제 출금 5건 이상이고, 그 과반이 직전 입금과 같은 금액.
+  //   돈이 쌓이지 않으므로 "쌓인 돈을 빼간다"가 성립하지 않는다 → 러그풀 판정 대상 아님.
+  const posWithdrawals = withdrawals.filter(r => (parseFloat(r.amount_eth) || 0) > 0);
+  let passThrough = false;
+  if (posWithdrawals.length >= 5) {
+    let matched = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const cur = rows[i];
+      if (!WITHDRAW_ACTIONS.has(cur.action)) continue;
+      const curAmt = parseFloat(cur.amount_eth) || 0;
+      if (curAmt <= 0) continue;
+      const prev = rows[i - 1];
+      const prevAmt = parseFloat(prev.amount_eth) || 0;
+      if (DEPOSIT_ACTIONS.has(prev.action) && prevAmt > 0 && prevAmt === curAmt) matched++;
+    }
+    passThrough = matched / posWithdrawals.length >= 0.50;
+    steps.push(`passThrough(T): ${passThrough} (직전 입금과 같은 금액 ${matched}/${posWithdrawals.length}건, 기준 과반)`);
+  } else {
+    steps.push(`passThrough(T): false (실제 출금 ${posWithdrawals.length}건 < 5)`);
   }
 
-  // ── Priority 3: PumpAndDump ──
-  if (someWithdrawalsSucceed && someWithdrawalsFail && insiderExitDetected) {
-    steps.push("→ pump_and_dump (mixed withdrawal outcomes + insider profit extraction)");
-    return { hint: "pump_and_dump", reasoning_steps: steps };
+  // ── 출금 차단 경고(ZeroWithdrawBlock)·PumpAndDump 판정용 데이터 속성 ──
+  // 오너 판별 1안: 배포자/ownerClient 주소를 상수로 식별한다.
+  // scripts/simulate_*.js가 공통으로 hardhat 기본 니모닉의 계정 0을
+  // ownerClient로 사용하므로(예: ponzi_log.csv의 owner_withdraw_all 수신자와 동일
+  // 주소) 이 주소는 시뮬레이션 전반에서 고정값이다.
+  const OWNER_ADDRESS = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+  // 출금 차단 경고(오너 외 출금이 거의 전부 실패) 판정 임계값. "거의 없음"을 5%로 잡은 근거는
+  // 아직 실증 데이터 기반 튜닝이 아니라 잠정값이다 — 실제 사례가 쌓이면 재검토.
+  const NON_PRIVILEGED_SUCCESS_EPSILON = 0.05;
+
+  // PumpAndDump 판정용 "실패 시점 잔고 ≈ 0" 임계값.
+  // TODO(ε 미정): 지금은 임의의 0.01 ETH 같은 숫자를 넣지 않고 엄격한 0
+  // 비교만 적용한다 — 실제 PumpDump 시뮬레이션(analysis/logs/pumpdump_log.csv)의
+  // balanceAtFailure는 정확히 0이라 이 값으로는 영향 없음. SelectiveTrap의
+  // balanceAtFailure(예: 9.0 ETH)와는 이미 크게 벌어져 있어 엡실론을 늦게
+  // 정해도 당장 오분류로 이어지지 않는다. 부동소수점 반올림 오차가 있는
+  // 실데이터가 들어오면 이 값을 다시 정해야 한다.
+  const PUMPDUMP_BALANCE_AT_FAILURE_EPSILON = 0; // TODO: 실증 데이터로 확정 필요
+
+  const withdrawSuccessRate = withdrawals.length > 0
+    ? withdrawals.filter(r => (parseFloat(r.amount_eth) || 0) > 0).length / withdrawals.length
+    : 0;
+
+  const nonPrivilegedWithdrawals = withdrawals.filter(
+    r => (r.to || "").toLowerCase() !== OWNER_ADDRESS
+  );
+  const nonPrivilegedSuccessRate = nonPrivilegedWithdrawals.length > 0
+    ? nonPrivilegedWithdrawals.filter(r => (parseFloat(r.amount_eth) || 0) > 0).length
+        / nonPrivilegedWithdrawals.length
+    : 0;
+
+  // balanceAtFailure: someWithdrawalsFail과 동일한 필터(amount_eth === 0인 withdraw 행)에
+  // contract_balance_eth 필드만 얹는다 — "실패"를 새로 재정의하지 않는다.
+  // 평균이 아닌 최댓값을 채택: 오너가 일부만 먼저 인출하고 실패 시점들이 드레인
+  // 전/후에 걸쳐 섞이면 평균은 드레인 이후의 낮은 잔고 쪽으로 끌려 내려가 "실패
+  // 시점에도 자금이 남아있었다"는 증거가 희석된다. 최댓값은 단 한 번의 실패라도
+  // 잔고가 유의미하게 남아있었다는 사실을 보존해 PumpDump(=항상 0)와 더 선명하게
+  // 갈린다.
+  const failedWithdrawBalances = withdrawals
+    .filter(r => (parseFloat(r.amount_eth) || 0) === 0)
+    .map(r => parseFloat(r.contract_balance_eth) || 0);
+  const balanceAtFailure = failedWithdrawBalances.length > 0
+    ? Math.max(...failedWithdrawBalances)
+    : 0;
+
+  steps.push(
+    `withdrawSuccessRate: ${(withdrawSuccessRate * 100).toFixed(1)}% ` +
+    `(${withdrawals.filter(r => (parseFloat(r.amount_eth) || 0) > 0).length}/${withdrawals.length} succeeded)`
+  );
+  steps.push(
+    `nonPrivilegedSuccessRate: ${(nonPrivilegedSuccessRate * 100).toFixed(1)}% ` +
+    `(owner ${OWNER_ADDRESS.slice(0, 10)}... 제외 ${nonPrivilegedWithdrawals.length}건 중 성공)`
+  );
+  steps.push(
+    `balanceAtFailure: ${balanceAtFailure.toFixed(3)} ETH ` +
+    `(amount_eth=0 시점 잔고 최댓값, n=${failedWithdrawBalances.length})`
+  );
+
+  // ── 출금 차단 신호 ZeroWithdrawBlock (2026-10, 허니팟 사기 유형 삭제) ──
+  // 기존 honeypot 분기 조건에서 inflowContinues만 뺀 것: 오너 외 출금 시도가 있고, 그 성공률이
+  // ε 이하이며, 실패 시점에도 잔고가 남아 있음. 오너만 인출하는 선택적 차단도 걸린다.
+  // nonPrivilegedWithdrawals.length>0 가드: 비-오너 출금 시도가 한 건도 없으면(증거 부재)
+  // nonPrivilegedSuccessRate가 0/0→0으로 계산돼 근거 없이 경고가 나지 않게 한다.
+  // 사기 유형이 아니라 경고 신호다 — 아래 사기 조건이 모두 불일치일 때만 unclassified_warning을
+  // 내고(Normal 대신), dynamic_risk_score에는 더하지 않는다.
+  // 분류 체인과 무관하게 항상 계산해 withdraw_block_warning으로 병기한다(유형이 확정돼도 출력, b안).
+  const zeroWithdrawBlock =
+    nonPrivilegedWithdrawals.length > 0 &&
+    nonPrivilegedSuccessRate <= NON_PRIVILEGED_SUCCESS_EPSILON &&
+    balanceAtFailure > 0;
+  const withdrawBlockWarning = {
+    detected: zeroWithdrawBlock,
+    reason: nonPrivilegedWithdrawals.length === 0
+      ? "비오너 출금 시도 없음"
+      : `비오너 출금 ${nonPrivilegedWithdrawals.length}건 중 성공률 ` +
+        `${(nonPrivilegedSuccessRate * 100).toFixed(1)}% ` +
+        `${nonPrivilegedSuccessRate <= NON_PRIVILEGED_SUCCESS_EPSILON ? "<=" : ">"} ` +
+        `${(NON_PRIVILEGED_SUCCESS_EPSILON * 100).toFixed(0)}%, ` +
+        `실패 시점 잔고 ${balanceAtFailure.toFixed(3)} ETH${balanceAtFailure > 0 ? " > 0" : ""}`
+  };
+
+  // (Flash Loan 분기 삭제 — 시스템 범위에서 제외. OSCILLATING_BALANCE 신호 계산은 그대로 둔다)
+
+  // ── Priority 2: PumpAndDump ──
+  // balanceAtFailure ≈ 0 조건을 추가로 요구한다(엡실론 값 자체는 위 TODO 참고,
+  // 지금은 엄격한 0 비교). 오너만 인출하고 잔고가 남은 채 나머지 출금이 실패하는
+  // 경우(balanceAtFailure > 0)는 이 조건으로 PumpAndDump에서 빠지고, 다른 사기 조건도
+  // 불일치이면 아래 출금 차단 경고로 간다.
+  // 교차 공리: 실주소 데이터에서는 SharedProfit(내부자 여럿이 이익 실현)을 요구한다.
+  if (someWithdrawalsSucceed && someWithdrawalsFail && insiderExitDetected &&
+      (!hasRealAddresses || sharedProfit) &&
+      balanceAtFailure <= PUMPDUMP_BALANCE_AT_FAILURE_EPSILON) {
+    steps.push(
+      "→ pump_and_dump (mixed withdrawal outcomes + insider profit extraction, " +
+      `balanceAtFailure ${balanceAtFailure.toFixed(3)} ETH <= ε)`
+    );
+    return { hint: "pump_and_dump", reasoning_steps: steps,
+             withdrawSuccessRate, nonPrivilegedSuccessRate, balanceAtFailure, withdrawBlockWarning };
   }
 
-  // ── Priority 4: MoneyLaundering ──
+  // ── Priority 3: MoneyLaundering ──
   // Single large outflow + distributed inflow + recipient IS a known depositor
   if (singleLargeOutflow && distributedInflow && !ownerWithdrawAll) {
     steps.push(
       `→ money_laundering (large outflow + ${uniqueDepositorCount} distributed depositors` +
       ` + collector is a known depositor)`
     );
-    return { hint: "money_laundering", reasoning_steps: steps };
+    return { hint: "money_laundering", reasoning_steps: steps,
+             withdrawSuccessRate, nonPrivilegedSuccessRate, balanceAtFailure, withdrawBlockWarning };
   }
 
-  // ── Priority 5: RugPull ──
-  if (singleLargeOutflow && ownerWithdrawAll && !participantMidExit) {
-    steps.push("→ rug_pull (large outflow to non-depositor address, no participant mid-exits)");
-    return { hint: "rug_pull", reasoning_steps: steps };
+  // ── Priority 4: RugPull ──
+  // 최종안: RugPull ← [범위] ¬T ∧ [기본] NetDrain ∧ [교차] ¬SharedProfit
+  // 주소가 합성된 데이터(hasRealAddresses=false)는 지갑별 계산이 불가능해 기존 규칙을 쓴다.
+  const rugPull = hasRealAddresses
+    ? (!passThrough && netDrain && !sharedProfit)
+    : (singleLargeOutflow && ownerWithdrawAll && !participantMidExit);
+  if (rugPull) {
+    steps.push(hasRealAddresses
+      ? `→ rug_pull (¬T ∧ NetDrain ${(netDrainRatio * 100).toFixed(0)}% ∧ ¬SharedProfit ${profitSharerCount}명)`
+      : "→ rug_pull (legacy: large outflow to non-depositor address, no participant mid-exits)");
+    return { hint: "rug_pull", reasoning_steps: steps,
+             withdrawSuccessRate, nonPrivilegedSuccessRate, balanceAtFailure, withdrawBlockWarning };
   }
 
-  // ── Priority 6: PonziScheme ──
-  if (ids.has("BALANCE_DROP") && ids.has("FLOW_SPIKE") && participantMidExit) {
+  // ── Priority 5: PonziScheme ──
+  // 교차 공리: 실주소 데이터에서는 SharedProfit(수익을 2명 이상이 나눠 가짐)을 요구한다.
+  if (ids.has("BALANCE_DROP") && ids.has("FLOW_SPIKE") && participantMidExit &&
+      (!hasRealAddresses || sharedProfit)) {
     steps.push(
       `→ ponzi_scheme (balance drop + flow spike + ${midExits.length} participant mid-exits)`
     );
-    return { hint: "ponzi_scheme", reasoning_steps: steps };
+    return { hint: "ponzi_scheme", reasoning_steps: steps,
+             withdrawSuccessRate, nonPrivilegedSuccessRate, balanceAtFailure, withdrawBlockWarning };
   }
 
-  // ── Priority 7: Normal ──
-  if (rows.some(r => r.action === "stake" || r.action === "unstake")) {
+  // ── Priority 6: 유형 미확정 + 출금 차단 경고 ──
+  if (zeroWithdrawBlock) {
+    steps.push(
+      `→ unclassified_warning: 유형 미확정, 출금 차단 경고 (ZeroWithdrawBlock: ` +
+      `nonPrivilegedSuccessRate ${(nonPrivilegedSuccessRate * 100).toFixed(1)}% ` +
+      `<= ${(NON_PRIVILEGED_SUCCESS_EPSILON * 100).toFixed(0)}%, ` +
+      `balanceAtFailure ${balanceAtFailure.toFixed(3)} ETH > 0, 사기 유형 조건 불일치)`
+    );
+    return { hint: "unclassified_warning", reasoning_steps: steps,
+             withdrawSuccessRate, nonPrivilegedSuccessRate, balanceAtFailure, withdrawBlockWarning };
+  }
+
+  // ── Priority 7: Normal (사기 조건 불일치 AND NOT ZeroWithdrawBlock) ──
+  if (!zeroWithdrawBlock && rows.some(r => r.action === "stake" || r.action === "unstake")) {
     steps.push("→ normal_staking (stake/unstake pattern, no fraud signals)");
-    return { hint: "normal_staking", reasoning_steps: steps };
+    return { hint: "normal_staking", reasoning_steps: steps,
+             withdrawSuccessRate, nonPrivilegedSuccessRate, balanceAtFailure, withdrawBlockWarning };
   }
 
   steps.push("→ unknown (no rules matched)");
-  return { hint: "unknown", reasoning_steps: steps };
+  return { hint: "unknown", reasoning_steps: steps,
+           withdrawSuccessRate, nonPrivilegedSuccessRate, balanceAtFailure, withdrawBlockWarning };
 }
 
 // ── InflowStop signal ─────────────────────────────────────────────────────────
@@ -395,10 +553,8 @@ function detectInflowStop(rows, isOrganicUnstake) {
 function detectEvasionSubclass(rows, baseFraudType) {
   const THRESHOLD = 30;
 
-  // Skip evasion check for non-fraud types and honeypot
-  // (honeypot's zero-withdrawals are the attack mechanism, not an evasion technique)
-  if (baseFraudType === "Normal" || baseFraudType === "Unknown" ||
-      baseFraudType === "Honeypot") return null;
+  // Skip evasion check for non-fraud types (unclassified_warning maps to Unknown)
+  if (baseFraudType === "Normal" || baseFraudType === "Unknown") return null;
 
   const withdrawals = rows.filter(r => WITHDRAW_ACTIONS.has(r.action));
   if (withdrawals.length === 0) return null;
@@ -499,7 +655,6 @@ const FRAUD_TYPE_MAP = {
   "ponzi_scheme":        "PonziScheme",
   "ponzi_or_laundering": "PonziScheme",
   "flash_loan":          "FlashLoan",
-  "honeypot":            "Honeypot",
   "normal_staking":      "Normal"
 };
 
@@ -515,6 +670,10 @@ export function analyzeDynamic(csvPath) {
       verdict:           "UNKNOWN",
       fraud_type_hint:   "unknown",
       reasoning_steps:   [],
+      withdraw_success_rate:       0,
+      non_privileged_success_rate: 0,
+      balance_at_failure_eth:      0,
+      withdraw_block_warning:      { detected: false, reason: "CSV 없음" },
       anomaly_signals:   {},
       evasion_detected:  false,
       evasion_subclass:  null,
@@ -581,6 +740,10 @@ export function analyzeDynamic(csvPath) {
   const hintResult      = hintFraudType(rows, triggered);
   const fraud_type_hint = hintResult.hint;
   const reasoning_steps = hintResult.reasoning_steps;
+  const withdraw_block_warning = hintResult.withdrawBlockWarning;
+  if (withdraw_block_warning.detected && fraud_type_hint !== "unclassified_warning") {
+    reasoning_steps.push(`유형은 ${fraud_type_hint}으로 확정, 별도로 출금 차단 경고 병기 (${withdraw_block_warning.reason})`);
+  }
 
   // InflowStop signal
   const inflowStop = detectInflowStop(rows, isOrganicUnstake);
@@ -611,6 +774,10 @@ export function analyzeDynamic(csvPath) {
     verdict,
     fraud_type_hint,
     reasoning_steps,
+    withdraw_success_rate:       +hintResult.withdrawSuccessRate.toFixed(3),
+    non_privileged_success_rate: +hintResult.nonPrivilegedSuccessRate.toFixed(3),
+    balance_at_failure_eth:      +hintResult.balanceAtFailure.toFixed(4),
+    withdraw_block_warning,
     anomaly_signals: {
       INFLOW_STOP: inflowStop
     },
